@@ -1,5 +1,5 @@
 # utils/sheets.py
-# Google Sheets integration (ملف واحد فيه أوراق: Member_Data, Tasks_Data, Requests)
+# Google Sheets integration (single spreadsheet with sheets: Member_Data, Tasks_Data, Requests, Approved)
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -7,25 +7,27 @@ from gspread_dataframe import get_as_dataframe, set_with_dataframe
 import pandas as pd
 from datetime import datetime
 from dateutil import parser
-import streamlit as st  # for secrets + cache
+import streamlit as st
 
+# ----- OAuth scopes -----
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
 
-# Sheet titles
+# ----- Sheet titles -----
 SHEET_MEMBERS   = "Member_Data"
 SHEET_TASKS     = "Tasks_Data"
 SHEET_REQUESTS  = "Requests"
+SHEET_APPROVED  = "Approved"
 
 # Member_Data (Arabic headers)
 COL_AR_NAME = "الاسم باللغة العربي"
 COL_EN_NAME = "الاسم باللغة الإنجليزية"  # optional
-COL_NAT_ID  = "رقم الهوية"
+COL_NAT_ID  = "رقم الهوية"               # optional
 COL_STUD_ID = "الرقم الجامعي"
-COL_EMAIL   = "البريد الإلكتروني الشخصي"
-COL_PHONE   = "رقم الجوال"
+COL_EMAIL   = "البريد الإلكتروني الشخصي" # optional
+COL_PHONE   = "رقم الجوال"               # optional
 COL_DEPT    = "Department"
 
 # Tasks_Data (Arabic headers)
@@ -33,6 +35,7 @@ COL_TASK_NAME    = "المهمة"
 COL_TASK_MINUTES = "المدة المقترحة ( بالدقائق)"
 COL_TASK_DEPT    = "القسم"
 
+# ----- Spreadsheet helpers -----
 def _client():
     sa = st.secrets["gcp_service_account"]
     creds = Credentials.from_service_account_info(sa, scopes=SCOPES)
@@ -40,14 +43,13 @@ def _client():
 
 def _open_spreadsheet():
     gc = _client()
-    # اسم الملف داخل secrets.toml -> [sheets].spreadsheet_name
     return gc.open(st.secrets["sheets"]["spreadsheet_name"])
 
 def _ws(sh, title):
     return sh.worksheet(title)
 
 def _read_df(ws) -> pd.DataFrame:
-    # قراءة مع إسقاط الصفوف الفارغة تمامًا
+    # Drop fully empty rows
     return get_as_dataframe(ws, evaluate_formulas=True, header=0).dropna(how="all")
 
 def _write_df(ws, df: pd.DataFrame):
@@ -66,20 +68,45 @@ def _new_id(df: pd.DataFrame) -> int:
     ids = pd.to_numeric(df["id"], errors="coerce")
     return int(pd.Series(ids).fillna(0).max()) + 1
 
-# --------- يضمن وجود ورقة Requests ويُنشِئها لو مفقودة ---------
+def _utc_now_str():
+    return datetime.utcnow().isoformat(timespec="seconds")
+
+# ----- Ensure sheets (Requests / Approved) -----
 def _ensure_requests_sheet(sh):
-    """Create 'Requests' sheet with headers if missing."""
+    """Ensure 'Requests' exists with headers; create if missing."""
+    headers = ["id","name","member_id","date","hours","notes","status",
+               "hr_name","hr_notes","created_at","approved_at"]
     try:
-        return _ws(sh, SHEET_REQUESTS)
+        ws = _ws(sh, SHEET_REQUESTS)
     except Exception:
-        ws = sh.add_worksheet(title=SHEET_REQUESTS, rows=1000, cols=11)
-        headers = ["id","name","member_id","date","hours","notes","status",
-                   "hr_name","hr_notes","created_at","approved_at"]
+        ws = sh.add_worksheet(title=SHEET_REQUESTS, rows=1000, cols=len(headers))
         ws.update('A1:K1', [headers])
         return ws
+    # make sure all columns exist
+    df = _read_df(ws)
+    df = _ensure_cols(df, headers)
+    _write_df(ws, df)
+    return ws
 
-# ---------- Cached readers ----------
+def _ensure_approved_sheet(sh):
+    """Ensure 'Approved' exists with headers; create if missing."""
+    headers = ["id","name","member_id","date","hours","notes",
+               "hr_name","hr_notes","approved_at"]
+    try:
+        ws = _ws(sh, SHEET_APPROVED)
+    except Exception:
+        ws = sh.add_worksheet(title=SHEET_APPROVED, rows=1000, cols=len(headers))
+        ws.update('A1:I1', [headers])
+        return ws
+    # align columns
+    df = _read_df(ws)
+    df = _ensure_cols(df, headers)
+    # keep only the above headers (in order)
+    df = df[headers] if not df.empty else pd.DataFrame(columns=headers)
+    _write_df(ws, df)
+    return ws
 
+# ----- Cached readers -----
 @st.cache_data(ttl=60)
 def get_members_df() -> pd.DataFrame:
     """Read Member_Data; keep needed columns only."""
@@ -87,9 +114,7 @@ def get_members_df() -> pd.DataFrame:
     df = _read_df(_ws(sh, SHEET_MEMBERS))
     req = [COL_AR_NAME, COL_STUD_ID, COL_DEPT]
     df = _ensure_cols(df, req)
-    # Drop rows with no department or name
     df = df.dropna(subset=[COL_AR_NAME, COL_DEPT], how="any")
-    # Normalize to string
     df[COL_DEPT] = df[COL_DEPT].astype(str).str.strip()
     df[COL_AR_NAME] = df[COL_AR_NAME].astype(str).str.strip()
     df[COL_STUD_ID] = df[COL_STUD_ID].astype(str).str.strip()
@@ -102,16 +127,13 @@ def get_tasks_df() -> pd.DataFrame:
     df = _read_df(_ws(sh, SHEET_TASKS))
     req = [COL_TASK_NAME, COL_TASK_MINUTES, COL_TASK_DEPT]
     df = _ensure_cols(df, req)
-    # Clean + types
     df[COL_TASK_DEPT] = df[COL_TASK_DEPT].astype(str).str.strip()
     df[COL_TASK_NAME] = df[COL_TASK_NAME].astype(str).str.strip()
     df[COL_TASK_MINUTES] = pd.to_numeric(df[COL_TASK_MINUTES], errors="coerce")
-    # Keep only valid rows
     df = df.dropna(subset=[COL_TASK_DEPT, COL_TASK_NAME, COL_TASK_MINUTES], how="any")
     return df
 
-# ---------- Dropdown helpers ----------
-
+# ----- Dropdown helpers -----
 def list_departments():
     """Unique departments from Member_Data."""
     members = get_members_df()
@@ -125,8 +147,7 @@ def list_tasks_by_dept(dept: str) -> pd.DataFrame:
     tasks = get_tasks_df()
     return tasks[tasks[COL_TASK_DEPT] == str(dept).strip()].copy()
 
-# ---------- Requests ops ----------
-
+# ----- Requests ops -----
 def list_requests(status: str = None) -> pd.DataFrame:
     sh = _open_spreadsheet()
     ws = _ensure_requests_sheet(sh)
@@ -137,14 +158,11 @@ def list_requests(status: str = None) -> pd.DataFrame:
     df["hours"] = pd.to_numeric(df["hours"], errors="coerce")
     if status:
         df = df[df["status"] == status]
+    # Sort newest first by created_at then id
     return df.sort_values(by=["created_at","id"], ascending=[False, False]).reset_index(drop=True)
 
 def append_request_from_selection(dept: str, member_row: pd.Series, task_row: pd.Series, date_str: str) -> int:
-    """
-    Append to Requests using chosen department, member, and task.
-    - hours = minutes / 60 (float, 2 decimals)
-    - notes = "<القسم> - <المهمة> - <X> دقيقة"
-    """
+    """Append to Requests using chosen department, member, and task."""
     sh = _open_spreadsheet()
     ws = _ensure_requests_sheet(sh)
     df = _read_df(ws)
@@ -168,41 +186,108 @@ def append_request_from_selection(dept: str, member_row: pd.Series, task_row: pd
         "status": "pending",
         "hr_name": None,
         "hr_notes": None,
-        "created_at": datetime.utcnow().isoformat(timespec="seconds"),
+        "created_at": _utc_now_str(),
         "approved_at": None,
     }
+
     df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
     _write_df(ws, df)
+
+    # Clear caches so UI reflects changes instantly
+    st.cache_data.clear()
     return new_row["id"]
+
+def _upsert_approved_row(sh, record: dict):
+    """Insert or update a row in 'Approved' sheet by id."""
+    ws_appr = _ensure_approved_sheet(sh)
+    df_appr = _read_df(ws_appr)
+    headers = ["id","name","member_id","date","hours","notes","hr_name","hr_notes","approved_at"]
+    df_appr = _ensure_cols(df_appr, headers)
+
+    # Coerce id/hours types
+    rec = {
+        "id": int(record.get("id")),
+        "name": record.get("name"),
+        "member_id": record.get("member_id"),
+        "date": record.get("date"),
+        "hours": pd.to_numeric(record.get("hours"), errors="coerce"),
+        "notes": record.get("notes"),
+        "hr_name": record.get("hr_name"),
+        "hr_notes": record.get("hr_notes"),
+        "approved_at": record.get("approved_at") or _utc_now_str(),
+    }
+
+    mask = pd.to_numeric(df_appr["id"], errors="coerce").astype("Int64") == rec["id"]
+    if mask.any():
+        # Update in place
+        for k, v in rec.items():
+            df_appr.loc[mask, k] = v
+    else:
+        df_appr = pd.concat([df_appr, pd.DataFrame([rec])], ignore_index=True)
+
+    # Keep columns ordered
+    df_appr = df_appr[headers]
+    _write_df(ws_appr, df_appr)
 
 def approve_request(target_id: int, hr_name: str, hr_notes: str = "") -> bool:
     sh = _open_spreadsheet()
     ws = _ensure_requests_sheet(sh)
     df = _read_df(ws)
-    df = _ensure_cols(df, ["id"])
+    df = _ensure_cols(df, ["id","status","hr_name","hr_notes","approved_at"])
+
     mask = pd.to_numeric(df["id"], errors="coerce").astype("Int64") == int(target_id)
     if not mask.any():
         return False
-    df.loc[mask, "status"] = "approved"
-    df.loc[mask, "hr_name"] = (hr_name or "").strip()
-    df.loc[mask, "hr_notes"] = (hr_notes or "").strip()
-    df.loc[mask, "approved_at"] = datetime.utcnow().isoformat(timespec="seconds")
+
+    # Guard: already processed?
+    current_status = str(df.loc[mask, "status"].iloc[0] or "").lower()
+    if current_status == "approved":
+        # Still update HR fields if changed; and make sure in Approved sheet
+        df.loc[mask, "hr_name"] = (hr_name or "").strip()
+        df.loc[mask, "hr_notes"] = (hr_notes or "").strip()
+        df.loc[mask, "approved_at"] = _utc_now_str()
+    else:
+        df.loc[mask, "status"] = "approved"
+        df.loc[mask, "hr_name"] = (hr_name or "").strip()
+        df.loc[mask, "hr_notes"] = (hr_notes or "").strip()
+        df.loc[mask, "approved_at"] = _utc_now_str()
+
     _write_df(ws, df)
+
+    # Mirror to Approved sheet
+    # Build a record dict from the updated row
+    row = df.loc[mask].iloc[0].to_dict()
+    _upsert_approved_row(sh, row)
+
+    # Clear caches so UI refreshes
+    st.cache_data.clear()
     return True
 
 def reject_request(target_id: int, hr_name: str, hr_notes: str = "") -> bool:
     sh = _open_spreadsheet()
     ws = _ensure_requests_sheet(sh)
     df = _read_df(ws)
-    df = _ensure_cols(df, ["id"])
+    df = _ensure_cols(df, ["id","status","hr_name","hr_notes","approved_at"])
+
     mask = pd.to_numeric(df["id"], errors="coerce").astype("Int64") == int(target_id)
     if not mask.any():
         return False
+
+    current_status = str(df.loc[mask, "status"].iloc[0] or "").lower()
+    if current_status == "approved":
+        # Optional: prevent changing approved to rejected. Uncomment to enforce.
+        # return False
+        pass
+
     df.loc[mask, "status"] = "rejected"
     df.loc[mask, "hr_name"] = (hr_name or "").strip()
     df.loc[mask, "hr_notes"] = (hr_notes or "").strip()
     df.loc[mask, "approved_at"] = None
     _write_df(ws, df)
+
+    # No mirroring to Approved for rejected requests
+
+    st.cache_data.clear()
     return True
 
 def summary_by_member(status_filter: str = "approved") -> pd.DataFrame:

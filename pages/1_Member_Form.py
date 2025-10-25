@@ -1,3 +1,4 @@
+# 1_Member_Form.py
 import streamlit as st
 from datetime import date
 
@@ -48,8 +49,9 @@ if dept:
 # Date
 date_val = st.date_input("التاريخ", value=date.today())
 
-disabled = not (dept and member_row is not None and task_row is not None and date_val)
-if st.button("إرسال الطلب", type="primary", disabled=not disabled):
+ready = bool(dept and member_row is not None and task_row is not None and date_val)
+
+if st.button("إرسال الطلب", type="primary", disabled=not ready):
     req_id = append_request_from_selection(
         dept=dept,
         member_row=member_row,
@@ -57,3 +59,4 @@ if st.button("إرسال الطلب", type="primary", disabled=not disabled):
         date_str=date_val.isoformat(),
     )
     st.success(f"تم الإرسال. رقم الطلب: #{req_id}")
+
